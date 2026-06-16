@@ -4224,6 +4224,324 @@ def extract_csharp(path: Path) -> dict:
     return _extract_generic(path, _CSHARP_CONFIG)
 
 
+def _roslyn_extract(path: Path) -> dict | None:
+    """Try to extract via the bundled Roslyn CLI (roslyn-extractor.exe / roslyn-extractor).
+    Returns dict with nodes/edges on success, None if the tool is not found or fails.
+    Supports .vb and .cs files with full semantic analysis (type resolution, base classes,
+    implemented interfaces, return types, parameter types).
+    """
+    import json as _json
+    import subprocess as _sub
+    import sys as _sys
+
+    # Locate the executable next to this package's tools/roslyn/ directory.
+    _here = Path(__file__).parent.parent  # repo root
+    _candidates = [
+        _here / "tools" / "roslyn" / "roslyn-extractor.exe",   # Windows
+        _here / "tools" / "roslyn" / "roslyn-extractor",        # Linux/macOS
+    ]
+    _exe = next((c for c in _candidates if c.exists()), None)
+    if _exe is None:
+        return None
+
+    try:
+        proc = _sub.run(
+            [str(_exe), str(path.resolve())],
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            return None
+        return _json.loads(proc.stdout.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def extract_vbnet(path: Path) -> dict:
+    """Extract classes, modules, interfaces, subs, functions, and imports from .vb files.
+    Uses Roslyn (semantic) when available, falls back to regex extraction.
+    Originally regex-only (no tree-sitter-vb-dotnet PyPI package available).
+    Handles VB.NET 16.9 / .NET 5+ syntax. Case-insensitive throughout."""
+    # ── Try Roslyn first (semantic analysis) ─────────────────────────────────
+    roslyn_result = _roslyn_extract(path)
+    if roslyn_result is not None:
+        return roslyn_result
+
+    # ── Fallback: regex extraction ────────────────────────────────────────────
+    import re as _re
+
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"nodes": [], "edges": []}
+
+    str_path = str(path)
+    stem = _file_stem(path)
+    file_nid = _make_id(str_path)
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid,
+                "label": label,
+                "file_type": "code",
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED") -> None:
+        edges.append({
+            "source": src,
+            "target": tgt,
+            "relation": relation,
+            "confidence": confidence,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        })
+
+    add_node(file_nid, path.name, 1)
+
+    lines_text = source.splitlines()
+
+    # VB.NET access/modifier keywords (non-capturing, case-insensitive)
+    _MOD = (
+        r"(?:(?:Public|Private|Protected\s+Friend|Protected|Friend|"
+        r"Shared|Overridable|NotOverridable|MustOverride|Overrides|"
+        r"MustInherit|NotInheritable|Partial|Async|Iterator|"
+        r"ReadOnly|WriteOnly|Default|Overloads|Shadows|Static)\s+)*"
+    )
+
+    # ── Compiled patterns ──────────────────────────────────────────────────────
+    imports_re    = _re.compile(r"^\s*Imports\s+([\w.]+)", _re.IGNORECASE)
+    namespace_re  = _re.compile(r"^\s*Namespace\s+([\w.]+)", _re.IGNORECASE)
+    end_ns_re     = _re.compile(r"^\s*End\s+Namespace\b", _re.IGNORECASE)
+
+    class_re      = _re.compile(
+        rf"^\s*{_MOD}Class\s+(\w+)(?:\s*\(Of\s+[\w\s,]+\))?",
+        _re.IGNORECASE,
+    )
+    module_re     = _re.compile(rf"^\s*{_MOD}Module\s+(\w+)", _re.IGNORECASE)
+    interface_re  = _re.compile(rf"^\s*{_MOD}Interface\s+(\w+)", _re.IGNORECASE)
+    enum_re       = _re.compile(rf"^\s*{_MOD}Enum\s+(\w+)", _re.IGNORECASE)
+    structure_re  = _re.compile(rf"^\s*{_MOD}Structure\s+(\w+)", _re.IGNORECASE)
+
+    inherits_re   = _re.compile(r"^\s*Inherits\s+([\w.]+)", _re.IGNORECASE)
+    implements_re = _re.compile(r"^\s*Implements\s+([\w.,\s]+)", _re.IGNORECASE)
+
+    end_type_re   = _re.compile(
+        r"^\s*End\s+(?:Class|Module|Interface|Enum|Structure)\b",
+        _re.IGNORECASE,
+    )
+
+    sub_re        = _re.compile(
+        rf"^\s*{_MOD}(?:Sub)\s+(\w+)\s*(?:\(Of\s+[\w\s,]+\))?\s*\(",
+        _re.IGNORECASE,
+    )
+    function_re   = _re.compile(
+        rf"^\s*{_MOD}(?:Function)\s+(\w+)\s*(?:\(Of\s+[\w\s,]+\))?\s*\(",
+        _re.IGNORECASE,
+    )
+    property_re   = _re.compile(
+        rf"^\s*{_MOD}Property\s+(\w+)",
+        _re.IGNORECASE,
+    )
+    event_re      = _re.compile(
+        rf"^\s*{_MOD}Event\s+(\w+)",
+        _re.IGNORECASE,
+    )
+
+    # VB.NET keywords that can accidentally match class/method name patterns
+    _KEYWORDS = frozenset({
+        "if", "else", "end", "for", "while", "do", "select", "case",
+        "try", "catch", "finally", "return", "throw", "new", "nothing",
+        "true", "false", "me", "mybase", "myclass", "dim", "with",
+        "each", "next", "loop", "then", "to", "step", "exit", "continue",
+        "as", "is", "in", "not", "and", "or", "xor",
+    })
+
+    # Stack of (container_nid) for nested types
+    container_stack: list[str] = []
+
+    def current_container() -> str:
+        return container_stack[-1] if container_stack else file_nid
+
+    for lineno, line_text in enumerate(lines_text, start=1):
+        stripped = line_text.strip()
+
+        # Skip blank lines and VB comments
+        if not stripped:
+            continue
+        low = stripped.lower()
+        if low.startswith("'") or low.startswith("rem ") or low == "rem":
+            continue
+
+        # ── Imports ───────────────────────────────────────────────────────────
+        m = imports_re.match(stripped)
+        if m:
+            full_ns = m.group(1)
+            module_name = full_ns.split(".")[-1]
+            if module_name:
+                tgt_nid = _make_id(module_name)
+                if tgt_nid not in seen_ids:
+                    add_node(tgt_nid, module_name, lineno)
+                add_edge(file_nid, tgt_nid, "imports", lineno)
+            continue
+
+        # ── Namespace ─────────────────────────────────────────────────────────
+        m = namespace_re.match(stripped)
+        if m:
+            ns_full = m.group(1)
+            ns_name = ns_full.split(".")[-1]
+            ns_nid = _make_id(stem, ns_full)
+            add_node(ns_nid, ns_full, lineno)
+            add_edge(file_nid, ns_nid, "contains", lineno)
+            container_stack.append(ns_nid)
+            continue
+
+        if end_ns_re.match(stripped):
+            if container_stack:
+                container_stack.pop()
+            continue
+
+        # ── End Class / Module / Interface / Enum / Structure ─────────────────
+        if end_type_re.match(stripped):
+            if container_stack:
+                container_stack.pop()
+            continue
+
+        # ── Class ─────────────────────────────────────────────────────────────
+        m = class_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, name, lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                container_stack.append(nid)
+                continue
+
+        # ── Module ────────────────────────────────────────────────────────────
+        m = module_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, name, lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                container_stack.append(nid)
+                continue
+
+        # ── Interface ─────────────────────────────────────────────────────────
+        m = interface_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, name, lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                container_stack.append(nid)
+                continue
+
+        # ── Structure ─────────────────────────────────────────────────────────
+        m = structure_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, name, lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                container_stack.append(nid)
+                continue
+
+        # ── Enum ──────────────────────────────────────────────────────────────
+        m = enum_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, name, lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                container_stack.append(nid)
+                continue
+
+        # ── Inherits ──────────────────────────────────────────────────────────
+        m = inherits_re.match(stripped)
+        if m and container_stack:
+            base_name = m.group(1).split(".")[-1]
+            base_nid = _make_id(stem, base_name)
+            if base_nid not in seen_ids:
+                base_nid = _make_id(base_name)
+            if base_nid not in seen_ids:
+                add_node(base_nid, base_name, lineno)
+            add_edge(container_stack[-1], base_nid, "extends", lineno,
+                     confidence="INFERRED")
+            continue
+
+        # ── Implements ────────────────────────────────────────────────────────
+        m = implements_re.match(stripped)
+        if m and container_stack:
+            for iface_full in m.group(1).split(","):
+                iface = iface_full.strip().split(".")[-1]
+                if iface:
+                    iface_nid = _make_id(stem, iface)
+                    if iface_nid not in seen_ids:
+                        iface_nid = _make_id(iface)
+                    if iface_nid not in seen_ids:
+                        add_node(iface_nid, iface, lineno)
+                    add_edge(container_stack[-1], iface_nid, "implements", lineno,
+                             confidence="INFERRED")
+            continue
+
+        # ── Sub ───────────────────────────────────────────────────────────────
+        m = sub_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, f"{name}()", lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                continue
+
+        # ── Function ──────────────────────────────────────────────────────────
+        m = function_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, f"{name}()", lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                continue
+
+        # ── Property ──────────────────────────────────────────────────────────
+        m = property_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, name, lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                continue
+
+        # ── Event ─────────────────────────────────────────────────────────────
+        m = event_re.match(stripped)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                nid = _make_id(stem, name)
+                add_node(nid, name, lineno)
+                add_edge(current_container(), nid, "contains", lineno)
+                continue
+
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_apex(path: Path) -> dict:
     """Extract classes, interfaces, enums, methods, and Salesforce constructs from
     Apex .cls and .trigger files using regex (no tree-sitter grammar on PyPI)."""
@@ -11727,6 +12045,7 @@ _DISPATCH: dict[str, Any] = {
     ".hpp": extract_cpp,
     ".rb": extract_ruby,
     ".cs": extract_csharp,
+    ".vb": extract_vbnet,
     ".kt": extract_kotlin,
     ".kts": extract_kotlin,
     ".scala": extract_scala,

@@ -37,3 +37,6 @@ scripts/llm.py
 scripts/benchmark_kimi*.json
 scripts/benchmark_kimi*.py
 paper/
+tools/roslyn/
+roslyn-extractor/bin/
+roslyn-extractor/obj/

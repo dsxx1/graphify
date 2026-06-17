@@ -63,7 +63,7 @@ if (args[0] == "--batch")
         GraphResult r;
         if (!File.Exists(fp))
         {
-            r = new GraphResult(new List<GraphNode>(), new List<GraphEdge>());
+            r = new GraphResult(new List<GraphNode>(), new List<GraphEdge>(), new List<RawCall>());
             Console.Error.WriteLine($"[skip] not found: {fp}");
         }
         else
@@ -71,7 +71,7 @@ if (args[0] == "--batch")
             var e2 = Path.GetExtension(fp).ToLowerInvariant();
             r = e2 == ".vb"  ? VBExtractor.Extract(fp)
               : e2 == ".cs"  ? CSharpExtractor.Extract(fp)
-              : new GraphResult(new List<GraphNode>(), new List<GraphEdge>());
+              : new GraphResult(new List<GraphNode>(), new List<GraphEdge>(), new List<RawCall>());
         }
         Console.WriteLine(JsonSerializer.Serialize(r, jsonOpts));
     }
@@ -158,9 +158,20 @@ record GraphEdge(
     [property: JsonPropertyName("weight")]          double Weight
 );
 
+// Unresolved call: callee captured by name; graphify's resolve_cross_file_raw_calls
+// links it to a node by label after all files are known (conservative, INFERRED).
+record RawCall(
+    [property: JsonPropertyName("caller_nid")]      string CallerNid,
+    [property: JsonPropertyName("callee")]          string Callee,
+    [property: JsonPropertyName("is_member_call")]  bool   IsMemberCall,
+    [property: JsonPropertyName("source_file")]     string SourceFile,
+    [property: JsonPropertyName("source_location")] string SourceLocation
+);
+
 record GraphResult(
-    [property: JsonPropertyName("nodes")] List<GraphNode> Nodes,
-    [property: JsonPropertyName("edges")] List<GraphEdge> Edges
+    [property: JsonPropertyName("nodes")]     List<GraphNode> Nodes,
+    [property: JsonPropertyName("edges")]     List<GraphEdge> Edges,
+    [property: JsonPropertyName("raw_calls")] List<RawCall>   RawCalls
 );
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -388,6 +399,7 @@ static class VBExtractor
         // globalSeen prevents duplicate nodes across files (e.g. shared base class).
         var allNodes = new List<GraphNode>();
         var allEdges = new List<GraphEdge>();
+        var allRawCalls = new List<RawCall>();
         var globalSeen = new HashSet<string>();
 
         foreach (var tree in trees)
@@ -395,9 +407,10 @@ static class VBExtractor
             var partial = ExtractFromTree(tree, compilation.GetSemanticModel(tree), globalSeen);
             allNodes.AddRange(partial.Nodes);
             allEdges.AddRange(partial.Edges);
+            allRawCalls.AddRange(partial.RawCalls);
         }
 
-        return new GraphResult(allNodes, allEdges);
+        return new GraphResult(allNodes, allEdges, allRawCalls);
     }
 
     public static GraphResult Extract(string filePath)
@@ -459,6 +472,12 @@ static class VBExtractor
                 nodes.Add(new GraphNode(rid, label, "rationale", strPath, $"L{line}", "rationale"));
             AddEdge(rid, parentNid, "rationale_for", $"L{line}");
         }
+
+        // Call-graph state: method name -> nid (intra-file resolution) + the methods
+        // to scan for invocations + unresolved (cross-file) calls.
+        var rawCalls = new List<RawCall>();
+        var methodNidByName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var methodList = new List<(MethodBlockSyntax Block, string Nid)>();
 
         AddNode(fileNid, Path.GetFileName(filePath), "file", "L1");
 
@@ -656,6 +675,8 @@ static class VBExtractor
             AddNode(nid, label, kind, lr);
             AddEdge(ContainerNid(method), nid, "contains", lr);
             AddRationale(method, nid);
+            methodNidByName[name] = nid;
+            methodList.Add((method, nid));
 
             // Semantic: return type
             var sym = model.GetDeclaredSymbol(method) as IMethodSymbol;
@@ -789,7 +810,39 @@ static class VBExtractor
             }
         }
 
-        return new GraphResult(nodes, edges);
+        // ── Calls: method invocations. Intra-file → "calls" edge now; cross-file →
+        // raw_calls, resolved by graphify (resolve_cross_file_raw_calls) by label.
+        var callPairs = new HashSet<string>();
+        foreach (var (mblock, callerNid) in methodList)
+        {
+            foreach (var inv in mblock.DescendantNodes()
+                         .OfType<Microsoft.CodeAnalysis.VisualBasic.Syntax.InvocationExpressionSyntax>())
+            {
+                string callee = "";
+                bool isMember = false;
+                if (inv.Expression is Microsoft.CodeAnalysis.VisualBasic.Syntax.IdentifierNameSyntax idn)
+                    callee = idn.Identifier.Text;
+                else if (inv.Expression is Microsoft.CodeAnalysis.VisualBasic.Syntax.MemberAccessExpressionSyntax mae)
+                {
+                    callee = mae.Name.Identifier.Text;
+                    isMember = true;
+                }
+                if (callee.Length == 0 || Helpers.IsVBKeyword(callee)) continue;
+                var clr = Helpers.LineRef(inv);
+                if (methodNidByName.TryGetValue(callee, out var tgt))
+                {
+                    if (tgt == callerNid) continue;
+                    if (callPairs.Add(callerNid + "" + tgt))
+                        edges.Add(new GraphEdge(callerNid, tgt, "calls", "EXTRACTED", strPath, clr, 1.0));
+                }
+                else
+                {
+                    rawCalls.Add(new RawCall(callerNid, callee, isMember, strPath, clr));
+                }
+            }
+        }
+
+        return new GraphResult(nodes, edges, rawCalls);
     }
 }
 
@@ -823,7 +876,7 @@ static class CSharpExtractor
             allNodes.AddRange(partial.Nodes);
             allEdges.AddRange(partial.Edges);
         }
-        return new GraphResult(allNodes, allEdges);
+        return new GraphResult(allNodes, allEdges, new List<RawCall>());
     }
 
 
@@ -1053,6 +1106,6 @@ static class CSharpExtractor
             }
         }
 
-        return new GraphResult(nodes, edges);
+        return new GraphResult(nodes, edges, new List<RawCall>());
     }
 }

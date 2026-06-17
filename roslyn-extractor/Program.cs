@@ -110,6 +110,48 @@ else if (args[0] == "--project")
 
     Console.WriteLine(JsonSerializer.Serialize(result, jsonOpts));
 }
+else if (args[0] == "--project-filelist")
+{
+    // ── PROJECT MODE from an explicit file list ──────────────────────────────
+    // One shared compilation (cross-file semantic call resolution), but the
+    // caller picks the files (e.g. to exclude generated/UI noise). Bypasses the
+    // OS command-line length limit that --batch hits on large repos.
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("--project-filelist requires a list-file path (one path per line)");
+        Environment.Exit(1);
+    }
+    var listFile = args[1];
+    if (!File.Exists(listFile))
+    {
+        Console.Error.WriteLine($"List file not found: {listFile}");
+        Environment.Exit(1);
+    }
+    var all = File.ReadAllLines(listFile)
+                  .Select(l => l.Trim())
+                  .Where(l => l.Length > 0 && File.Exists(l))
+                  .ToArray();
+    var vb = all.Where(f => f.EndsWith(".vb", StringComparison.OrdinalIgnoreCase)).ToArray();
+    var cs = all.Where(f => f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)).ToArray();
+    if (vb.Length == 0 && cs.Length == 0)
+    {
+        Console.Error.WriteLine("List file contains no existing .vb or .cs files");
+        Environment.Exit(1);
+    }
+    // Optional 2nd list: CONTEXT files (compiled for binding, not extracted).
+    string[]? ctxVb = null;
+    if (args.Length >= 3 && File.Exists(args[2]))
+    {
+        ctxVb = File.ReadAllLines(args[2])
+            .Select(l => l.Trim())
+            .Where(l => l.EndsWith(".vb", StringComparison.OrdinalIgnoreCase) && File.Exists(l))
+            .ToArray();
+    }
+    var result = (cs.Length > 0 && vb.Length == 0)
+        ? CSharpExtractor.ExtractProject(cs)
+        : VBExtractor.ExtractProject(vb, ctxVb);
+    Console.WriteLine(JsonSerializer.Serialize(result, jsonOpts));
+}
 else
 {
     // ── SINGLE FILE MODE ─────────────────────────────────────────────────────
@@ -372,39 +414,45 @@ static class VBExtractor
     /// resolves cross-file type references (e.g. base class defined in another file).
     /// Returns merged nodes+edges for the whole project.
     /// </summary>
-    public static GraphResult ExtractProject(string[] filePaths)
+    public static GraphResult ExtractProject(string[] filePaths) =>
+        ExtractProject(filePaths, null);
+
+    /// <summary>
+    /// Project compilation with an optional CONTEXT set: context files are parsed
+    /// into the same Compilation so binding resolves (e.g. platform base classes),
+    /// but only the extract files produce nodes. Calls to context-only methods are
+    /// dropped (they are not graph nodes); calls between extract files resolve
+    /// cross-file semantically.
+    /// </summary>
+    public static GraphResult ExtractProject(string[] extractFiles, string[]? contextFiles)
     {
-        var corlib = Helpers.ResolveCorLib();
-        var mscorlib = MetadataReference.CreateFromFile(corlib);
+        var mscorlib = MetadataReference.CreateFromFile(Helpers.ResolveCorLib());
 
-        // Parse all files into syntax trees
-        var trees = filePaths
-            .Where(File.Exists)
-            .Select(fp =>
-            {
-                var src = File.ReadAllText(fp, System.Text.Encoding.UTF8);
-                return VisualBasicSyntaxTree.ParseText(
-                    SourceText.From(src, System.Text.Encoding.UTF8), path: fp);
-            })
-            .ToArray();
+        SyntaxTree Parse(string fp) =>
+            VisualBasicSyntaxTree.ParseText(
+                SourceText.From(File.ReadAllText(fp, System.Text.Encoding.UTF8),
+                                System.Text.Encoding.UTF8), path: fp);
 
-        // ONE compilation for the whole project — cross-file semantics
+        var extractTrees = extractFiles.Where(File.Exists).Select(Parse).ToArray();
+        var contextTrees = (contextFiles ?? Array.Empty<string>()).Where(File.Exists).Select(Parse).ToArray();
+
         var compilation = VisualBasicCompilation.Create(
             "RoslynProject",
-            syntaxTrees: trees,
+            syntaxTrees: extractTrees.Concat(contextTrees),
             references: new[] { mscorlib },
             options: new VisualBasicCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
-        // Merge results from each file using the shared semantic model.
-        // globalSeen prevents duplicate nodes across files (e.g. shared base class).
+        // Only files in the extract set produce nodes / are valid call targets.
+        var extractPaths = new HashSet<string>(extractTrees.Select(t => t.FilePath));
+
         var allNodes = new List<GraphNode>();
         var allEdges = new List<GraphEdge>();
         var allRawCalls = new List<RawCall>();
         var globalSeen = new HashSet<string>();
 
-        foreach (var tree in trees)
+        foreach (var tree in extractTrees)
         {
-            var partial = ExtractFromTree(tree, compilation.GetSemanticModel(tree), globalSeen);
+            var partial = ExtractFromTree(tree, compilation.GetSemanticModel(tree), globalSeen, extractPaths);
             allNodes.AddRange(partial.Nodes);
             allEdges.AddRange(partial.Edges);
             allRawCalls.AddRange(partial.RawCalls);
@@ -433,7 +481,8 @@ static class VBExtractor
     /// <summary>Core extraction logic — shared between single-file and project modes.</summary>
     /// <summary>Core extraction logic — shared between single-file and project modes.</summary>
     public static GraphResult ExtractFromTree(
-        SyntaxTree syntaxTree, SemanticModel model, HashSet<string> seen)
+        SyntaxTree syntaxTree, SemanticModel model, HashSet<string> seen,
+        HashSet<string>? extractPaths = null)
     {
         var filePath = syntaxTree.FilePath;
         var root  = syntaxTree.GetRoot();
@@ -818,6 +867,30 @@ static class VBExtractor
             foreach (var inv in mblock.DescendantNodes()
                          .OfType<Microsoft.CodeAnalysis.VisualBasic.Syntax.InvocationExpressionSyntax>())
             {
+                // 1) Semantic resolution to a source-declared method (cross-file in --project mode).
+                var clrSem = Helpers.LineRef(inv);
+                var sym = model.GetSymbolInfo(inv).Symbol as IMethodSymbol;
+                if (sym != null)
+                {
+                    var def = sym.OriginalDefinition ?? sym;
+                    var declRefs = def.DeclaringSyntaxReferences;
+                    if (declRefs.Length > 0 && def.ContainingType != null
+                        && !string.IsNullOrEmpty(def.ContainingType.Name))
+                    {
+                        var tgtFile = declRefs[0].SyntaxTree.FilePath;
+                        // Context-only files (platform) bind but are not graph nodes.
+                        if (extractPaths == null || extractPaths.Contains(tgtFile))
+                        {
+                            var declStem = Path.GetFileNameWithoutExtension(tgtFile);
+                            var tgtSem = Helpers.MakeId(declStem, def.ContainingType.Name, def.Name);
+                            if (tgtSem != callerNid && callPairs.Add(callerNid + "\t" + tgtSem))
+                                edges.Add(new GraphEdge(callerNid, tgtSem, "calls", "EXTRACTED", strPath, clrSem, 1.0));
+                        }
+                        continue;
+                    }
+                }
+
+                // 2)/3) Syntactic fallback (single-file / batch mode: no cross-file compilation).
                 string callee = "";
                 bool isMember = false;
                 if (inv.Expression is Microsoft.CodeAnalysis.VisualBasic.Syntax.IdentifierNameSyntax idn)

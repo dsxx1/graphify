@@ -4224,31 +4224,106 @@ def extract_csharp(path: Path) -> dict:
     return _extract_generic(path, _CSHARP_CONFIG)
 
 
+def _roslyn_exe() -> "Path | None":
+    """Return path to roslyn-extractor binary, or None if not built yet."""
+    _here = Path(__file__).parent.parent  # repo root
+    for name in ("roslyn-extractor.exe", "roslyn-extractor"):
+        p = _here / "tools" / "roslyn" / name
+        if p.exists():
+            return p
+    return None
+
+
 def _roslyn_extract(path: Path) -> dict | None:
-    """Try to extract via the bundled Roslyn CLI (roslyn-extractor.exe / roslyn-extractor).
-    Returns dict with nodes/edges on success, None if the tool is not found or fails.
-    Supports .vb and .cs files with full semantic analysis (type resolution, base classes,
-    implemented interfaces, return types, parameter types).
-    """
+    """Single-file Roslyn extraction. Returns dict or None on failure/unavailable."""
     import json as _json
     import subprocess as _sub
-    import sys as _sys
 
-    # Locate the executable next to this package's tools/roslyn/ directory.
-    _here = Path(__file__).parent.parent  # repo root
-    _candidates = [
-        _here / "tools" / "roslyn" / "roslyn-extractor.exe",   # Windows
-        _here / "tools" / "roslyn" / "roslyn-extractor",        # Linux/macOS
-    ]
-    _exe = next((c for c in _candidates if c.exists()), None)
+    _exe = _roslyn_exe()
     if _exe is None:
         return None
-
     try:
         proc = _sub.run(
             [str(_exe), str(path.resolve())],
             capture_output=True,
             timeout=30,
+        )
+        if proc.returncode != 0:
+            return None
+        return _json.loads(proc.stdout.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def roslyn_extract_batch(paths: "list[Path]") -> "list[dict]":
+    """Batch Roslyn extraction: ONE subprocess call for N files (JIT cost paid once).
+    Returns list of dicts in the same order as paths. Falls back to empty dict on error.
+
+    Use this instead of calling extract_vbnet() in a loop — ~10-20x faster on large repos.
+
+    Example::
+        from pathlib import Path
+        from graphify.extract import roslyn_extract_batch
+        results = roslyn_extract_batch(list(Path("my_project").rglob("*.vb")))
+    """
+    import json as _json
+    import subprocess as _sub
+
+    _exe = _roslyn_exe()
+    if _exe is None or not paths:
+        return [{"nodes": [], "edges": []} for _ in paths]
+
+    try:
+        proc = _sub.run(
+            [str(_exe), "--batch"] + [str(p.resolve()) for p in paths],
+            capture_output=True,
+            timeout=max(60, len(paths) * 2),
+        )
+        if proc.returncode != 0:
+            return [{"nodes": [], "edges": []} for _ in paths]
+        lines = proc.stdout.decode("utf-8", errors="replace").splitlines()
+        results = []
+        for line in lines:
+            line = line.strip()
+            if line:
+                try:
+                    results.append(_json.loads(line))
+                except Exception:
+                    results.append({"nodes": [], "edges": []})
+        # Pad if fewer lines than files
+        while len(results) < len(paths):
+            results.append({"nodes": [], "edges": []})
+        return results
+    except Exception:
+        return [{"nodes": [], "edges": []} for _ in paths]
+
+
+def roslyn_extract_project(directory: Path) -> "dict | None":
+    """Project-mode Roslyn extraction: compiles ALL .vb (or .cs) files in *directory*
+    into a single Compilation so Roslyn resolves cross-file type references.
+
+    This is the recommended mode for real repositories — base classes defined in
+    other files are correctly resolved as SEMANTIC edges.
+
+    Returns merged {nodes, edges} dict, or None if Roslyn is unavailable.
+
+    Example::
+        from pathlib import Path
+        from graphify.extract import roslyn_extract_project
+        result = roslyn_extract_project(Path("C:/Projects/MySolution"))
+        print(len(result["nodes"]), "nodes")
+    """
+    import json as _json
+    import subprocess as _sub
+
+    _exe = _roslyn_exe()
+    if _exe is None:
+        return None
+    try:
+        proc = _sub.run(
+            [str(_exe), "--project", str(directory.resolve())],
+            capture_output=True,
+            timeout=120,
         )
         if proc.returncode != 0:
             return None

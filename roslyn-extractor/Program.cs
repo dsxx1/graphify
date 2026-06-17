@@ -2,9 +2,18 @@
 /// Roslyn-based extractor for VB.NET and C# files.
 /// Outputs JSON { nodes: [...], edges: [...] } to stdout.
 ///
-/// Usage:
-///   roslyn-extractor <file.vb>   -- extract single file
-///   roslyn-extractor <file.cs>   -- extract single file
+/// Modes:
+///   roslyn-extractor <file.vb|file.cs>
+///       Single-file mode — one JSON result on stdout.
+///
+///   roslyn-extractor --batch <file1> <file2> ...
+///       Batch mode — one JSON result per file, separated by newlines (NDJSON).
+///       JIT cost paid once; ~10-20× faster than N separate subprocess calls.
+///
+///   roslyn-extractor --project <dir>
+///       Project mode — all .vb (or .cs) files in dir compiled together into ONE
+///       Compilation so Roslyn resolves cross-file type references semantically.
+///       Output: merged {nodes, edges} for the whole project.
 /// </summary>
 
 using System;
@@ -20,42 +29,113 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
 
+Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+var jsonOpts = new JsonSerializerOptions
+{
+    WriteIndented = false,
+    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+};
+
 // ── Entry point (top-level statements MUST precede type declarations) ────────
 
 if (args.Length < 1)
 {
-    Console.Error.WriteLine("Usage: roslyn-extractor <file.vb|file.cs>");
+    Console.Error.WriteLine(
+        "Usage:\n" +
+        "  roslyn-extractor <file.vb|file.cs>\n" +
+        "  roslyn-extractor --batch <file1> <file2> ...\n" +
+        "  roslyn-extractor --project <directory>");
     Environment.Exit(1);
 }
 
-var filePath = args[0];
-if (!File.Exists(filePath))
+if (args[0] == "--batch")
 {
-    Console.Error.WriteLine($"File not found: {filePath}");
-    Environment.Exit(1);
+    // ── BATCH MODE: one JSON line per file (NDJSON) ──────────────────────────
+    var files = args.Skip(1).ToArray();
+    if (files.Length == 0)
+    {
+        Console.Error.WriteLine("--batch requires at least one file path");
+        Environment.Exit(1);
+    }
+    foreach (var fp in files)
+    {
+        GraphResult r;
+        if (!File.Exists(fp))
+        {
+            r = new GraphResult(new List<GraphNode>(), new List<GraphEdge>());
+            Console.Error.WriteLine($"[skip] not found: {fp}");
+        }
+        else
+        {
+            var e2 = Path.GetExtension(fp).ToLowerInvariant();
+            r = e2 == ".vb"  ? VBExtractor.Extract(fp)
+              : e2 == ".cs"  ? CSharpExtractor.Extract(fp)
+              : new GraphResult(new List<GraphNode>(), new List<GraphEdge>());
+        }
+        Console.WriteLine(JsonSerializer.Serialize(r, jsonOpts));
+    }
 }
+else if (args[0] == "--project")
+{
+    // ── PROJECT MODE: multi-file semantic compilation ────────────────────────
+    if (args.Length < 2)
+    {
+        Console.Error.WriteLine("--project requires a directory path");
+        Environment.Exit(1);
+    }
+    var dir = args[1];
+    if (!Directory.Exists(dir))
+    {
+        Console.Error.WriteLine($"Directory not found: {dir}");
+        Environment.Exit(1);
+    }
 
-GraphResult result;
-var ext = Path.GetExtension(filePath).ToLowerInvariant();
+    var vbFiles = Directory.GetFiles(dir, "*.vb", SearchOption.AllDirectories);
+    var csFiles = Directory.GetFiles(dir, "*.cs", SearchOption.AllDirectories);
 
-if (ext == ".vb")
-    result = VBExtractor.Extract(filePath);
-else if (ext == ".cs")
-    result = CSharpExtractor.Extract(filePath);
+    GraphResult result;
+    if (vbFiles.Length > 0 && csFiles.Length == 0)
+        result = VBExtractor.ExtractProject(vbFiles);
+    else if (csFiles.Length > 0 && vbFiles.Length == 0)
+        result = CSharpExtractor.ExtractProject(csFiles);
+    else if (vbFiles.Length > 0)
+        result = VBExtractor.ExtractProject(vbFiles);   // mixed: prefer VB
+    else
+    {
+        Console.Error.WriteLine("No .vb or .cs files found in directory");
+        Environment.Exit(1);
+        return;
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(result, jsonOpts));
+}
 else
 {
-    Console.Error.WriteLine($"Unsupported extension: {ext}");
-    Environment.Exit(1);
-    return;
-}
+    // ── SINGLE FILE MODE ─────────────────────────────────────────────────────
+    var filePath = args[0];
+    if (!File.Exists(filePath))
+    {
+        Console.Error.WriteLine($"File not found: {filePath}");
+        Environment.Exit(1);
+    }
 
-var json = JsonSerializer.Serialize(result, new JsonSerializerOptions
-{
-    WriteIndented = false,
-    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-});
-Console.OutputEncoding = System.Text.Encoding.UTF8;
-Console.WriteLine(json);
+    var ext = Path.GetExtension(filePath).ToLowerInvariant();
+    GraphResult result;
+
+    if (ext == ".vb")
+        result = VBExtractor.Extract(filePath);
+    else if (ext == ".cs")
+        result = CSharpExtractor.Extract(filePath);
+    else
+    {
+        Console.Error.WriteLine($"Unsupported extension: {ext}");
+        Environment.Exit(1);
+        return;
+    }
+
+    Console.WriteLine(JsonSerializer.Serialize(result, jsonOpts));
+}
 
 // ── JSON models ──────────────────────────────────────────────────────────────
 
@@ -197,20 +277,135 @@ static class Helpers
     }
 
     public static string LineRef(int oneBased) => $"L{oneBased}";
+
+    static readonly System.Text.RegularExpressions.Regex XmlTag =
+        new System.Text.RegularExpressions.Regex(
+            "<[^>]+>", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    static void AppendCommentLines(string raw, List<string> block)
+    {
+        foreach (var ln in raw.Split('\n'))
+        {
+            // strip comment markers: VB ', C# // /* */ ///, XML-doc '''
+            var s = ln.Trim().TrimStart('\'', '/', '*').Trim();
+            if (s.EndsWith("*/")) s = s.Substring(0, s.Length - 2).Trim();
+            s = XmlTag.Replace(s, " ").Trim();
+            if (s.Length > 0) block.Add(s);
+        }
+    }
+
+    /// <summary>
+    /// Collect the contiguous block of leading comments (' line-comments and
+    /// '''-XML-doc) that immediately precede a VB declaration, as plain text.
+    /// A run of 2+ blank lines breaks the association — such a comment belongs
+    /// to something else, not this declaration. Returns "" when none.
+    /// </summary>
+    public static string VBLeadingComment(SyntaxNode node)
+    {
+        var block = new List<string>();
+        int blankRun = 0;
+        foreach (var tr in node.GetLeadingTrivia())
+        {
+            var k = Microsoft.CodeAnalysis.VisualBasic.VisualBasicExtensions.Kind(tr);
+            if (k == Microsoft.CodeAnalysis.VisualBasic.SyntaxKind.EndOfLineTrivia)
+            {
+                blankRun++;
+                if (blankRun >= 3) block.Clear();   // 2+ blank lines -> not ours
+                continue;
+            }
+            if (k == Microsoft.CodeAnalysis.VisualBasic.SyntaxKind.WhitespaceTrivia)
+                continue;
+            if (k != Microsoft.CodeAnalysis.VisualBasic.SyntaxKind.CommentTrivia
+                && k != Microsoft.CodeAnalysis.VisualBasic.SyntaxKind.DocumentationCommentTrivia)
+                continue;
+            blankRun = 0;
+            AppendCommentLines(tr.ToFullString(), block);
+        }
+        return string.Join(" ", block).Trim();
+    }
+
+    /// <summary>C# counterpart of <see cref="VBLeadingComment"/> (// , /* */, ///).</summary>
+    public static string CSLeadingComment(SyntaxNode node)
+    {
+        var block = new List<string>();
+        int blankRun = 0;
+        foreach (var tr in node.GetLeadingTrivia())
+        {
+            var k = Microsoft.CodeAnalysis.CSharp.CSharpExtensions.Kind(tr);
+            if (k == Microsoft.CodeAnalysis.CSharp.SyntaxKind.EndOfLineTrivia)
+            {
+                blankRun++;
+                if (blankRun >= 3) block.Clear();
+                continue;
+            }
+            if (k == Microsoft.CodeAnalysis.CSharp.SyntaxKind.WhitespaceTrivia)
+                continue;
+            if (k != Microsoft.CodeAnalysis.CSharp.SyntaxKind.SingleLineCommentTrivia
+                && k != Microsoft.CodeAnalysis.CSharp.SyntaxKind.MultiLineCommentTrivia
+                && k != Microsoft.CodeAnalysis.CSharp.SyntaxKind.SingleLineDocumentationCommentTrivia
+                && k != Microsoft.CodeAnalysis.CSharp.SyntaxKind.MultiLineDocumentationCommentTrivia)
+                continue;
+            blankRun = 0;
+            AppendCommentLines(tr.ToFullString(), block);
+        }
+        return string.Join(" ", block).Trim();
+    }
 }
 
 // ── VB.NET extractor ─────────────────────────────────────────────────────────
 
 static class VBExtractor
 {
+    /// <summary>
+    /// Multi-file project compilation: all files share ONE Compilation so Roslyn
+    /// resolves cross-file type references (e.g. base class defined in another file).
+    /// Returns merged nodes+edges for the whole project.
+    /// </summary>
+    public static GraphResult ExtractProject(string[] filePaths)
+    {
+        var corlib = Helpers.ResolveCorLib();
+        var mscorlib = MetadataReference.CreateFromFile(corlib);
+
+        // Parse all files into syntax trees
+        var trees = filePaths
+            .Where(File.Exists)
+            .Select(fp =>
+            {
+                var src = File.ReadAllText(fp, System.Text.Encoding.UTF8);
+                return VisualBasicSyntaxTree.ParseText(
+                    SourceText.From(src, System.Text.Encoding.UTF8), path: fp);
+            })
+            .ToArray();
+
+        // ONE compilation for the whole project — cross-file semantics
+        var compilation = VisualBasicCompilation.Create(
+            "RoslynProject",
+            syntaxTrees: trees,
+            references: new[] { mscorlib },
+            options: new VisualBasicCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+
+        // Merge results from each file using the shared semantic model.
+        // globalSeen prevents duplicate nodes across files (e.g. shared base class).
+        var allNodes = new List<GraphNode>();
+        var allEdges = new List<GraphEdge>();
+        var globalSeen = new HashSet<string>();
+
+        foreach (var tree in trees)
+        {
+            var partial = ExtractFromTree(tree, compilation.GetSemanticModel(tree), globalSeen);
+            allNodes.AddRange(partial.Nodes);
+            allEdges.AddRange(partial.Edges);
+        }
+
+        return new GraphResult(allNodes, allEdges);
+    }
+
     public static GraphResult Extract(string filePath)
     {
         var source = File.ReadAllText(filePath, System.Text.Encoding.UTF8);
         var syntaxTree = VisualBasicSyntaxTree.ParseText(
-            SourceText.From(source, System.Text.Encoding.UTF8),
-            path: filePath);
+            SourceText.From(source, System.Text.Encoding.UTF8), path: filePath);
 
-        // Semantic compilation (single-file; gives full type resolution within file)
         var mscorlib = MetadataReference.CreateFromFile(Helpers.ResolveCorLib());
         var compilation = VisualBasicCompilation.Create(
             "RoslynExtract",
@@ -218,12 +413,20 @@ static class VBExtractor
             references: new[] { mscorlib },
             options: new VisualBasicCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
-        var model = compilation.GetSemanticModel(syntaxTree);
+        var seen = new HashSet<string>();
+        return ExtractFromTree(syntaxTree, compilation.GetSemanticModel(syntaxTree), seen);
+    }
+
+    /// <summary>Core extraction logic — shared between single-file and project modes.</summary>
+    /// <summary>Core extraction logic — shared between single-file and project modes.</summary>
+    public static GraphResult ExtractFromTree(
+        SyntaxTree syntaxTree, SemanticModel model, HashSet<string> seen)
+    {
+        var filePath = syntaxTree.FilePath;
         var root  = syntaxTree.GetRoot();
 
         var nodes = new List<GraphNode>();
         var edges = new List<GraphEdge>();
-        var seen  = new HashSet<string>();
 
         var strPath = filePath;
         var stem    = Path.GetFileNameWithoutExtension(filePath);
@@ -239,6 +442,22 @@ static class VBExtractor
                      string confidence = "EXTRACTED")
         {
             edges.Add(new GraphEdge(src, tgt, relation, confidence, strPath, lineRef, 1.0));
+        }
+
+        // Harvest the leading ' / '''-comment that documents a declaration as a
+        // "rationale" node linked to the code it explains (the README "why" layer).
+        // This is the developers' own business-language description — extracted
+        // locally, no LLM, no guessing.
+        void AddRationale(SyntaxNode decl, string parentNid)
+        {
+            var text = Helpers.VBLeadingComment(decl);
+            if (text.Length == 0) return;
+            var line  = decl.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
+            var rid   = Helpers.MakeId(stem, "rationale", line.ToString());
+            var label = text.Length > 80 ? text.Substring(0, 80) : text;
+            if (seen.Add(rid))
+                nodes.Add(new GraphNode(rid, label, "rationale", strPath, $"L{line}", "rationale"));
+            AddEdge(rid, parentNid, "rationale_for", $"L{line}");
         }
 
         AddNode(fileNid, Path.GetFileName(filePath), "file", "L1");
@@ -309,6 +528,7 @@ static class VBExtractor
             var lr  = Helpers.LineRef(cb.ClassStatement);
             AddNode(nid, name, "class", lr);
             AddEdge(ContainerNid(cb), nid, "contains", lr);
+            AddRationale(cb, nid);
 
             // Semantics: resolve base class
             var sym = model.GetDeclaredSymbol(cb) as INamedTypeSymbol;
@@ -321,7 +541,7 @@ static class VBExtractor
                     var baseId   = Helpers.MakeId(stem, baseName);
                     if (!seen.Contains(baseId)) baseId = Helpers.MakeId(baseName);
                     if (!seen.Contains(baseId)) AddNode(baseId, baseName, "class", lr);
-                    AddEdge(nid, baseId, "extends", lr, "SEMANTIC");
+                    AddEdge(nid, baseId, "extends", lr, "EXTRACTED");
                 }
                 // Interfaces
                 foreach (var iface in sym.Interfaces)
@@ -330,7 +550,7 @@ static class VBExtractor
                     var ifId   = Helpers.MakeId(stem, ifName);
                     if (!seen.Contains(ifId)) ifId = Helpers.MakeId(ifName);
                     if (!seen.Contains(ifId)) AddNode(ifId, ifName, "interface", lr);
-                    AddEdge(nid, ifId, "implements", lr, "SEMANTIC");
+                    AddEdge(nid, ifId, "implements", lr, "EXTRACTED");
                 }
             }
         }
@@ -344,6 +564,7 @@ static class VBExtractor
             var lr  = Helpers.LineRef(mb.ModuleStatement);
             AddNode(nid, name, "module", lr);
             AddEdge(ContainerNid(mb), nid, "contains", lr);
+            AddRationale(mb, nid);
         }
 
         // Interfaces
@@ -355,6 +576,7 @@ static class VBExtractor
             var lr  = Helpers.LineRef(ib.InterfaceStatement);
             AddNode(nid, name, "interface", lr);
             AddEdge(ContainerNid(ib), nid, "contains", lr);
+            AddRationale(ib, nid);
 
             // Semantic: base interfaces
             var sym = model.GetDeclaredSymbol(ib) as INamedTypeSymbol;
@@ -366,7 +588,7 @@ static class VBExtractor
                     var ifId   = Helpers.MakeId(stem, ifName);
                     if (!seen.Contains(ifId)) ifId = Helpers.MakeId(ifName);
                     if (!seen.Contains(ifId)) AddNode(ifId, ifName, "interface", lr);
-                    AddEdge(nid, ifId, "extends", lr, "SEMANTIC");
+                    AddEdge(nid, ifId, "extends", lr, "EXTRACTED");
                 }
             }
         }
@@ -380,6 +602,7 @@ static class VBExtractor
             var lr  = Helpers.LineRef(eb.EnumStatement);
             AddNode(nid, name, "enum", lr);
             AddEdge(ContainerNid(eb), nid, "contains", lr);
+            AddRationale(eb, nid);
 
             // Enum members
             foreach (var member in eb.Members.OfType<Microsoft.CodeAnalysis.VisualBasic.Syntax.EnumMemberDeclarationSyntax>())
@@ -389,6 +612,7 @@ static class VBExtractor
                 var mLr   = Helpers.LineRef(member);
                 AddNode(mNid, mName, "enum_member", mLr);
                 AddEdge(nid, mNid, "contains", mLr);
+                AddRationale(member, mNid);
             }
         }
 
@@ -401,6 +625,7 @@ static class VBExtractor
             var lr  = Helpers.LineRef(sb.StructureStatement);
             AddNode(nid, name, "struct", lr);
             AddEdge(ContainerNid(sb), nid, "contains", lr);
+            AddRationale(sb, nid);
 
             // Semantic: interfaces implemented by struct
             var sym = model.GetDeclaredSymbol(sb) as INamedTypeSymbol;
@@ -412,7 +637,7 @@ static class VBExtractor
                     var ifId   = Helpers.MakeId(stem, ifName);
                     if (!seen.Contains(ifId)) ifId = Helpers.MakeId(ifName);
                     if (!seen.Contains(ifId)) AddNode(ifId, ifName, "interface", lr);
-                    AddEdge(nid, ifId, "implements", lr, "SEMANTIC");
+                    AddEdge(nid, ifId, "implements", lr, "EXTRACTED");
                 }
             }
         }
@@ -430,6 +655,7 @@ static class VBExtractor
             var kind  = stmt.IsKind(Microsoft.CodeAnalysis.VisualBasic.SyntaxKind.SubStatement) ? "sub" : "function";
             AddNode(nid, label, kind, lr);
             AddEdge(ContainerNid(method), nid, "contains", lr);
+            AddRationale(method, nid);
 
             // Semantic: return type
             var sym = model.GetDeclaredSymbol(method) as IMethodSymbol;
@@ -442,7 +668,7 @@ static class VBExtractor
                     var retId = Helpers.MakeId(stem, retName);
                     if (!seen.Contains(retId)) retId = Helpers.MakeId(retName);
                     if (!seen.Contains(retId)) AddNode(retId, retName, "class", lr);
-                    AddEdge(nid, retId, "returns", lr, "SEMANTIC");
+                    AddEdge(nid, retId, "returns", lr, "EXTRACTED");
                 }
             }
 
@@ -458,7 +684,7 @@ static class VBExtractor
                     var pId = Helpers.MakeId(stem, pName);
                     if (!seen.Contains(pId)) pId = Helpers.MakeId(pName);
                     if (!seen.Contains(pId)) AddNode(pId, pName, "class", lr);
-                    AddEdge(nid, pId, "uses_type", lr, "SEMANTIC");
+                    AddEdge(nid, pId, "uses_type", lr, "EXTRACTED");
                 }
             }
         }
@@ -472,6 +698,7 @@ static class VBExtractor
             var nid = Helpers.MakeId(stem, ContainerNid(prop).Split('.').Last(), name);
             AddNode(nid, name, "property", lr);
             AddEdge(ContainerNid(prop), nid, "contains", lr);
+            AddRationale(prop, nid);
 
             // Semantic: property type
             var sym = model.GetDeclaredSymbol(prop.PropertyStatement) as IPropertySymbol;
@@ -484,7 +711,7 @@ static class VBExtractor
                     var tId = Helpers.MakeId(stem, tName);
                     if (!seen.Contains(tId)) tId = Helpers.MakeId(tName);
                     if (!seen.Contains(tId)) AddNode(tId, tName, "class", lr);
-                    AddEdge(nid, tId, "type_of", lr, "SEMANTIC");
+                    AddEdge(nid, tId, "type_of", lr, "EXTRACTED");
                 }
             }
         }
@@ -500,6 +727,7 @@ static class VBExtractor
             var nid = Helpers.MakeId(stem, ContainerNid(prop).Split('.').Last(), name);
             AddNode(nid, name, "property", lr);
             AddEdge(ContainerNid(prop), nid, "contains", lr);
+            AddRationale(prop, nid);
 
             var sym = model.GetDeclaredSymbol(prop) as IPropertySymbol;
             if (sym != null && sym.Type.SpecialType == SpecialType.None
@@ -511,7 +739,7 @@ static class VBExtractor
                     var tId = Helpers.MakeId(stem, tName);
                     if (!seen.Contains(tId)) tId = Helpers.MakeId(tName);
                     if (!seen.Contains(tId)) AddNode(tId, tName, "class", lr);
-                    AddEdge(nid, tId, "type_of", lr, "SEMANTIC");
+                    AddEdge(nid, tId, "type_of", lr, "EXTRACTED");
                 }
             }
         }
@@ -525,6 +753,7 @@ static class VBExtractor
             var nid = Helpers.MakeId(stem, ContainerNid(ev).Split('.').Last(), name);
             AddNode(nid, name, "event", lr);
             AddEdge(ContainerNid(ev), nid, "contains", lr);
+            AddRationale(ev, nid);
         }
 
         // Fields (Dim / Private _field As Type)
@@ -540,6 +769,7 @@ static class VBExtractor
                     var nid = Helpers.MakeId(stem, ContainerNid(field).Split('.').Last(), name);
                     AddNode(nid, name, "field", lr);
                     AddEdge(ContainerNid(field), nid, "contains", lr);
+                    AddRationale(field, nid);
 
                     // Semantic: field type
                     var sym = model.GetDeclaredSymbol(nameId) as IFieldSymbol;
@@ -552,7 +782,7 @@ static class VBExtractor
                             var tId = Helpers.MakeId(stem, tName);
                             if (!seen.Contains(tId)) tId = Helpers.MakeId(tName);
                             if (!seen.Contains(tId)) AddNode(tId, tName, "class", lr);
-                            AddEdge(nid, tId, "type_of", lr, "SEMANTIC");
+                            AddEdge(nid, tId, "type_of", lr, "EXTRACTED");
                         }
                     }
                 }
@@ -567,12 +797,41 @@ static class VBExtractor
 
 static class CSharpExtractor
 {
+    public static GraphResult ExtractProject(string[] filePaths)
+    {
+        var mscorlib = MetadataReference.CreateFromFile(Helpers.ResolveCorLib());
+        var trees = filePaths
+            .Where(File.Exists)
+            .Select(fp => CSharpSyntaxTree.ParseText(
+                SourceText.From(File.ReadAllText(fp, System.Text.Encoding.UTF8),
+                                System.Text.Encoding.UTF8), path: fp))
+            .ToArray();
+
+        var compilation = CSharpCompilation.Create(
+            "RoslynProject",
+            syntaxTrees: trees,
+            references: new[] { mscorlib },
+            options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+
+        var allNodes  = new List<GraphNode>();
+        var allEdges  = new List<GraphEdge>();
+        var globalSeen = new HashSet<string>();
+
+        foreach (var tree in trees)
+        {
+            var partial = Extract(tree.FilePath, compilation.GetSemanticModel(tree), globalSeen);
+            allNodes.AddRange(partial.Nodes);
+            allEdges.AddRange(partial.Edges);
+        }
+        return new GraphResult(allNodes, allEdges);
+    }
+
+
     public static GraphResult Extract(string filePath)
     {
         var source = File.ReadAllText(filePath, System.Text.Encoding.UTF8);
         var syntaxTree = CSharpSyntaxTree.ParseText(
-            SourceText.From(source, System.Text.Encoding.UTF8),
-            path: filePath);
+            SourceText.From(source, System.Text.Encoding.UTF8), path: filePath);
 
         var mscorlib = MetadataReference.CreateFromFile(Helpers.ResolveCorLib());
         var compilation = CSharpCompilation.Create(
@@ -581,12 +840,15 @@ static class CSharpExtractor
             references: new[] { mscorlib },
             options: new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
-        var model = compilation.GetSemanticModel(syntaxTree);
-        var root  = syntaxTree.GetRoot();
+        return Extract(filePath, compilation.GetSemanticModel(syntaxTree), new HashSet<string>());
+    }
+
+    public static GraphResult Extract(string filePath, SemanticModel model, HashSet<string> seen)
+    {
+        var root  = model.SyntaxTree.GetRoot();
 
         var nodes = new List<GraphNode>();
         var edges = new List<GraphEdge>();
-        var seen  = new HashSet<string>();
 
         var strPath = filePath;
         var stem    = Path.GetFileNameWithoutExtension(filePath);
@@ -672,7 +934,7 @@ static class CSharpExtractor
                     var bId   = Helpers.MakeId(stem, bName);
                     if (!seen.Contains(bId)) bId = Helpers.MakeId(bName);
                     if (!seen.Contains(bId)) AddNode(bId, bName, "class", lr);
-                    AddEdge(nid, bId, "extends", lr, "SEMANTIC");
+                    AddEdge(nid, bId, "extends", lr, "EXTRACTED");
                 }
                 foreach (var iface in sym.Interfaces)
                 {
@@ -680,7 +942,7 @@ static class CSharpExtractor
                     var ifId   = Helpers.MakeId(stem, ifName);
                     if (!seen.Contains(ifId)) ifId = Helpers.MakeId(ifName);
                     if (!seen.Contains(ifId)) AddNode(ifId, ifName, "interface", lr);
-                    AddEdge(nid, ifId, "implements", lr, "SEMANTIC");
+                    AddEdge(nid, ifId, "implements", lr, "EXTRACTED");
                 }
             }
         }
@@ -747,7 +1009,7 @@ static class CSharpExtractor
                     var rId = Helpers.MakeId(stem, rName);
                     if (!seen.Contains(rId)) rId = Helpers.MakeId(rName);
                     if (!seen.Contains(rId)) AddNode(rId, rName, "class", lr);
-                    AddEdge(nid, rId, "returns", lr, "SEMANTIC");
+                    AddEdge(nid, rId, "returns", lr, "EXTRACTED");
                 }
             }
         }
@@ -772,7 +1034,7 @@ static class CSharpExtractor
                     var tId = Helpers.MakeId(stem, tName);
                     if (!seen.Contains(tId)) tId = Helpers.MakeId(tName);
                     if (!seen.Contains(tId)) AddNode(tId, tName, "class", lr);
-                    AddEdge(nid, tId, "type_of", lr, "SEMANTIC");
+                    AddEdge(nid, tId, "type_of", lr, "EXTRACTED");
                 }
             }
         }
